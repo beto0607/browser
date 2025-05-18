@@ -49,7 +49,6 @@ const HTMLTokenizer = struct {
     }
 
     fn consumeItem(self: *Self, item: parser_stream.InputStreamItem, sink: tokenizer_types.TokenSink) anyerror!void {
-        var t: tokenizer_types.Token = undefined;
         switch (self.state) {
             .data => {
                 if (item.eof) {
@@ -65,24 +64,18 @@ const HTMLTokenizer = struct {
                         self.state = .tag_open;
                     },
                     0x0000 => { // NULL
-                        // TODO: emit unexpected-null-character
-                        t = .{ .character = .{ .data = item.code_point } };
-                        try sink(t);
-                        try self.tokens.append(t);
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
                     },
                     else => {
-                        t = .{ .character = .{ .data = item.code_point } };
-                        try sink(t);
-                        try self.tokens.append(t);
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
                     },
                 }
             },
             .tag_open => {
                 if (item.eof) {
-                    // TODO: emit eof-before-tag-name
-                    t = .{ .character = .{ .data = 0x003c } }; // emit LESS-THAN SIGN
-                    try sink(t);
-                    try self.tokens.append(t);
+                    try self.emitError(HTMLParserErrors.EofBeforeTagName);
+                    try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -108,16 +101,15 @@ const HTMLTokenizer = struct {
                         try self.consumeItem(item, sink);
                     },
                     0x003f => { // QUESTION MARK (?)
-                        // TODO: emit unexpected-question-mark-instead-of-tag-name
+                        try self.emitError(HTMLParserErrors.UnexpectedQuestionMarkInsteadOfTagName);
                         self.current_token = .{ .comment = .{ .data = try self.allocator.alloc(u21, 0) } };
                         self.state = .bogus_comment;
                         try self.consumeItem(item, sink);
                     },
                     else => {
-                        // TODO: emit  invalid-first-character-of-tag-name
-                        t = .{ .character = .{ .data = 0x003c } }; // emit LESS-THANK SIGN
-                        try sink(t);
-                        try self.tokens.append(t);
+                        try self.emitError(HTMLParserErrors.InvalidFirstCharacterOfTagName);
+                        // emit LESS-THAN SIGN
+                        try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
                         self.state = .data;
                         try self.consumeItem(item, sink);
                     },
@@ -125,13 +117,11 @@ const HTMLTokenizer = struct {
             },
             .end_tag_open => {
                 if (item.eof) {
-                    // TODO: emit eof-before-tag-name
-                    t = .{ .character = .{ .data = 0x003c } }; // emit LESS-THANK SIGN
-                    try sink(t);
-                    try self.tokens.append(t);
-                    t = .{ .character = .{ .data = 0x002f } }; // emit SOLIDUS
-                    try sink(t);
-                    try self.tokens.append(t);
+                    try self.emitError(HTMLParserErrors.EofBeforeTagName);
+                    // emit LESS-THAN SIGN
+                    try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                    // emit SOLIDUS
+                    try self.emitToken(.{ .character = .{ .data = 0x002f } }, sink);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -150,11 +140,11 @@ const HTMLTokenizer = struct {
                         try self.consumeItem(item, sink);
                     },
                     0x003e => { // GREATER-THAN SIGN (>)
-                        // TODO: emit missing-end-tag-name
+                        try self.emitError(HTMLParserErrors.MissingEndTagName);
                         self.state = .data;
                     },
                     else => {
-                        // TODO: emit invalid-first-character-of-tag-name
+                        try self.emitError(HTMLParserErrors.InvalidFirstCharacterOfTagName);
                         self.current_token = .{ .comment = .{
                             .data = try self.allocator.alloc(u21, 0),
                         } };
@@ -165,7 +155,7 @@ const HTMLTokenizer = struct {
             },
             .tag_name => {
                 if (item.eof) {
-                    // TODO: emit eof-in-tag
+                    try self.emitError(HTMLParserErrors.EOFInTag);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -189,7 +179,7 @@ const HTMLTokenizer = struct {
                         try self.appendCharacterToCurrentTagName(lowercase_code_point);
                     },
                     0x0000 => { // NULL
-                        // TODO: emit unexpected-null-character
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         try self.appendCharacterToCurrentTagName(0xfffd);
                     },
                     else => {
@@ -218,7 +208,7 @@ const HTMLTokenizer = struct {
                         try self.consumeItem(item, sink);
                     },
                     0x003d => { // EQUALS SIGN (=)
-                        // TODO: emit unexpected-equals-sign-before-attribute-name
+                        try self.emitError(HTMLParserErrors.UnexpectedEqualsSignBeforeAttributeName);
 
                         self.current_attribute = .{
                             .name = try self.allocator.alloc(u21, 1),
@@ -263,14 +253,14 @@ const HTMLTokenizer = struct {
                         try self.appendCharacterToCurrentAttributeName(lowercase_code_point);
                     },
                     0x0000 => {
-                        // TODO: emit unexpected-null-character
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         try self.appendCharacterToCurrentAttributeName(0xfffd);
                     },
                     0x0022, // QUOTATION MARK (")
                     0x0027, //APOSTROPHE (')
                     0x003C, //LESS-THAN SIGN (<
                     => {
-                        //TODO: emit unexpected-character-in-attribute-name
+                        try self.emitError(HTMLParserErrors.UnexpectedCharacterInAttributeName);
                         try self.appendCharacterToCurrentAttributeName(item.code_point);
                     },
                     else => {
@@ -280,7 +270,7 @@ const HTMLTokenizer = struct {
             },
             .after_attribute_name => {
                 if (item.eof) {
-                    // TODO: emit eof-in-tag
+                    try self.emitError(HTMLParserErrors.EOFInTag);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -328,7 +318,7 @@ const HTMLTokenizer = struct {
                         self.state = .attribute_value_single_quoted;
                     },
                     0x003E => { // GREATER-THAN SIGN (>)
-                        // TODO: emit missing-attribute-value
+                        try self.emitError(HTMLParserErrors.MissingAttributeValue);
                         self.state = .data;
                         try self.emitCurrentToken(sink);
                     },
@@ -340,7 +330,7 @@ const HTMLTokenizer = struct {
             },
             .attribute_value_double_quoted => {
                 if (item.eof) {
-                    // TODO: emit eof-in-tag
+                    try self.emitError(HTMLParserErrors.EOFInTag);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -353,7 +343,7 @@ const HTMLTokenizer = struct {
                         self.state = .character_reference;
                     },
                     0x0000 => { // NULL
-                        // TODO: emit  unexpected-null-character
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         try self.appendCharacterToCurrentAttributeValue(0xfffd);
                     },
                     else => {
@@ -363,7 +353,7 @@ const HTMLTokenizer = struct {
             },
             .attribute_value_single_quoted => {
                 if (item.eof) {
-                    // TODO: emit eof-in-tag
+                    try self.emitError(HTMLParserErrors.EOFInTag);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -376,7 +366,7 @@ const HTMLTokenizer = struct {
                         self.state = .character_reference;
                     },
                     0x0000 => { // NULL
-                        // TODO: emit  unexpected-null-character
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         try self.appendCharacterToCurrentAttributeValue(0xfffd);
                     },
                     else => {
@@ -386,7 +376,7 @@ const HTMLTokenizer = struct {
             },
             .attribute_value_unquoted => {
                 if (item.eof) {
-                    // TODO: emit eof-in-tag
+                    try self.emitError(HTMLParserErrors.EOFInTag);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -410,7 +400,7 @@ const HTMLTokenizer = struct {
                     },
                     0x0000, // NULL
                     => {
-                        //TODO: emit unexpected-null-character parse error.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         try self.appendCharacterToCurrentAttributeValue(0xfffd);
                     },
                     0x0022, //QUOTATION MARK (")
@@ -419,7 +409,7 @@ const HTMLTokenizer = struct {
                     0x003D, //EQUALS SIGN (=)
                     0x0060, //GRAVE ACCENT (`)
                     => {
-                        // TODO: emit  unexpected-character-in-unquoted-attribute-value
+                        try self.emitError(HTMLParserErrors.UnexpectedCharacterInUnquotedAttributeValue);
                         try self.appendCharacterToCurrentAttributeValue(item.code_point);
                     },
                     else => {
@@ -429,7 +419,7 @@ const HTMLTokenizer = struct {
             },
             .after_attribute_value_quoted => {
                 if (item.eof) {
-                    // TODO: emit eof-in-tag
+                    try self.emitError(HTMLParserErrors.EOFInTag);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -454,8 +444,8 @@ const HTMLTokenizer = struct {
                         try self.emitCurrentToken(sink);
                     },
                     else => {
-                        //This is a missing-whitespace-between-attributes parse error. Reconsume in the before attribute name state.
-                        //TODO: emit missing-whitespace-between-attributes
+                        // This is a missing-whitespace-between-attributes parse error. Reconsume in the before attribute name state.
+                        try self.emitError(HTMLParserErrors.MissingWhitespaceBetweenAttributes);
                         self.state = .before_attribute_name;
                         try self.consumeItem(item, sink);
                     },
@@ -463,7 +453,7 @@ const HTMLTokenizer = struct {
             },
             .self_closing_start_tag => {
                 if (item.eof) {
-                    // TODO: emit eof-in-tag
+                    try self.emitError(HTMLParserErrors.EOFInTag);
                     try self.emitEOFToken(sink);
                     return;
                 }
@@ -486,7 +476,7 @@ const HTMLTokenizer = struct {
                     },
                     else => {
                         // This is an unexpected-solidus-in-tag parse error. Reconsume in the before attribute name state.
-                        //TODO: emit unexpected-solidus-in-tag
+                        try self.emitError(HTMLParserErrors.UnexpectedSolidusInTag);
                         self.state = .before_attribute_name;
                         try self.consumeItem(item, sink);
                     },
@@ -510,7 +500,7 @@ const HTMLTokenizer = struct {
                     0x0000, //NULL
                     => {
                         // Append a 0xFFFD REPLACEMENT CHARACTER character to the comment token's data.
-                        // TODO: emit unexpected-null-character
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         try self.appendCharacterToCurrentComment(0xfffd);
                     },
                     else => {
@@ -579,7 +569,9 @@ const HTMLTokenizer = struct {
                             self.state = .cdata_section;
                             return;
                         }
-                        // TODO: emit cdata-in-html-content
+
+                        try self.emitError(HTMLParserErrors.CdataInHtmlContent);
+
                         self.current_token = .{ .comment = .{ .data = try self.allocator.dupe(u21, &cdata) } };
                         self.state = .bogus_comment;
                         return;
@@ -603,7 +595,7 @@ const HTMLTokenizer = struct {
                     },
                     0x003E => { // GREATER-THAN SIGN (>)
                         // Switch to the data state. Emit the current comment token.
-                        // TODO: emit abrupt-closing-of-empty-comment
+                        try self.emitError(HTMLParserErrors.AbruptClosingOfEmptyComment);
                         self.state = .data;
                         try self.emitCurrentToken(sink);
                     },
@@ -617,7 +609,7 @@ const HTMLTokenizer = struct {
             .comment_start_dash => {
                 if (item.eof) {
                     // This is an eof-in-comment parse error. Emit the current comment token. Emit an end-of-file token.
-                    // TODO: emit eof-in-comment parse
+                    try self.emitError(HTMLParserErrors.EOFInComment);
 
                     try self.emitCurrentToken(sink);
                     try self.emitEOFToken(sink);
@@ -630,7 +622,7 @@ const HTMLTokenizer = struct {
                     },
                     0x003E => { // GREATER-THAN SIGN (>)
                         // Switch to the data state. Emit the current comment token.
-                        // TODO: emit abrupt-closing-of-empty-comment
+                        try self.emitError(HTMLParserErrors.AbruptClosingOfEmptyComment);
                         self.state = .data;
                         try self.emitCurrentToken(sink);
                     },
@@ -645,7 +637,7 @@ const HTMLTokenizer = struct {
             .comment => {
                 if (item.eof) {
                     // Emit the current comment token. Emit an end-of-file token.
-                    // TODO: emit eof-in-comment
+                    try self.emitError(HTMLParserErrors.EOFInComment);
                     try self.emitCurrentToken(sink);
                     try self.emitEOFToken(sink);
                     return;
@@ -662,7 +654,7 @@ const HTMLTokenizer = struct {
                     },
                     0x0000 => { // NULL
                         // Append a 0xFFFD REPLACEMENT CHARACTER character to the comment token's data.
-                        // TODO: emit unexpected-null-character
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         try self.appendCharacterToCurrentComment(0xfffd);
                     },
                     else => { // Anything else
@@ -730,7 +722,7 @@ const HTMLTokenizer = struct {
                     },
                     else => { // Anything else
                         // This is a nested-comment parse error. Reconsume in the comment end state.
-                        // TODO: emit nested-comment
+                        try self.emitError(HTMLParserErrors.NestedComment);
                         self.state = .comment_end;
                         try self.consumeItem(item, sink);
                     },
@@ -739,7 +731,7 @@ const HTMLTokenizer = struct {
             .comment_end_dash => {
                 if (item.eof) { // EOF
                     // Emit the current comment token. Emit an end-of-file token.
-                    // TODO: emit eof-in-comment
+                    try self.emitError(HTMLParserErrors.EOFInComment);
                     try self.emitCurrentToken(sink);
                     try self.emitEOFToken(sink);
                     return;
@@ -760,7 +752,7 @@ const HTMLTokenizer = struct {
             .comment_end => {
                 if (item.eof) { // EOF
                     // Emit the current comment token. Emit an end-of-file token.
-                    // TODO: emit eof-in-comment
+                    try self.emitError(HTMLParserErrors.EOFInComment);
 
                     try self.emitCurrentToken(sink);
                     try self.emitEOFToken(sink);
@@ -792,7 +784,7 @@ const HTMLTokenizer = struct {
             .comment_end_bang => {
                 if (item.eof) { // EOF
                     // Emit the current comment token. Emit an end-of-file token.
-                    // TODO: emit eof-in-comment
+                    try self.emitError(HTMLParserErrors.EOFInComment);
                     try self.emitCurrentToken(sink);
                     try self.emitEOFToken(sink);
                     return;
@@ -807,7 +799,7 @@ const HTMLTokenizer = struct {
                     },
                     0x003e => { // 0x003E GREATER-THAN SIGN (>)
                         // Switch to the data state. Emit the current comment token.
-                        // TODO: emit incorrectly-closed-comment
+                        try self.emitError(HTMLParserErrors.IncorrectlyClosedComment);
                         self.state = .data;
                         try self.emitCurrentToken(sink);
                     },
@@ -824,7 +816,7 @@ const HTMLTokenizer = struct {
             .doctype => {
                 if (item.eof) { // EOF
                     // Create a new DOCTYPE token. Set its force-quirks flag to on. Emit the current token. Emit an end-of-file token.
-                    // TODO: emit eof-in-doctype
+                    try self.emitError(HTMLParserErrors.EOFInDoctype);
                     self.current_token = .{ .doctype = .{
                         .force_quirks = true,
                     } };
@@ -848,7 +840,7 @@ const HTMLTokenizer = struct {
                     },
                     else => { // Anything else
                         // Reconsume in the before DOCTYPE name state.
-                        // TODO: emit missing-whitespace-before-doctype-name
+                        try self.emitError(HTMLParserErrors.MissingWhitespaceBeforeDoctypeName);
                         self.state = .before_doctype_name;
                         try self.consumeItem(item, sink);
                     },
@@ -857,7 +849,7 @@ const HTMLTokenizer = struct {
             .before_doctype_name => {
                 if (item.eof) { // EOF
                     // Create a new DOCTYPE token. Set its force-quirks flag to on. Emit the current token. Emit an end-of-file token.
-                    // TODO: emit eof-in-doctype
+                    try self.emitError(HTMLParserErrors.EOFInDoctype);
                     self.current_token = .{ .doctype = .{
                         .force_quirks = true,
                     } };
@@ -886,7 +878,7 @@ const HTMLTokenizer = struct {
                     },
                     0x0000 => { // NULL
                         // Create a new DOCTYPE token. Set the token's name to a 0xFFFD REPLACEMENT CHARACTER character. Switch to the DOCTYPE name state.
-                        // TODO: emit unexpected-null-character
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         self.current_token = .{
                             .doctype = .{
                                 .force_quirks = false,
@@ -897,7 +889,7 @@ const HTMLTokenizer = struct {
                     },
                     0x003E => { // GREATER-THAN SIGN (>)
                         // Create a new DOCTYPE token. Set its force-quirks flag to on. Switch to the data state. Emit the current token.
-                        // TODO: emit missing-doctype-name
+                        try self.emitError(HTMLParserErrors.MissingDoctypeName);
                         self.current_token = .{
                             .doctype = .{
                                 .force_quirks = false,
@@ -922,7 +914,7 @@ const HTMLTokenizer = struct {
             .doctype_name => {
                 if (item.eof) { // EOF
                     // Set the current DOCTYPE token's force-quirks flag to on. Emit the current DOCTYPE token. Emit an end-of-file token.
-                    // TODO: emit eof-in-doctype
+                    try self.emitError(HTMLParserErrors.EOFInDoctype);
                     self.current_token.?.doctype.force_quirks = true;
                     try self.emitCurrentToken(sink);
                     try self.emitEOFToken(sink);
@@ -953,7 +945,7 @@ const HTMLTokenizer = struct {
                     0x0000, // NULL
                     => {
                         // Append a 0xFFFD REPLACEMENT CHARACTER character to the current DOCTYPE token's name.
-                        // TODO: emit unexpected-null-character
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
                         try self.appendCharacterToDoctypeName(0xfffd);
                     },
                     else => { // Anything else
@@ -1528,6 +1520,12 @@ const HTMLTokenizer = struct {
         try sink(t);
         try self.tokens.append(t);
     }
+
+    fn emitToken(self: *Self, token: tokenizer_types.Token, sink: tokenizer_types.TokenSink) !void {
+        try sink(token);
+        try self.tokens.append(token);
+    }
+
     fn emitCurrentToken(self: *Self, sink: tokenizer_types.TokenSink) !void {
         try sink(self.current_token.?);
         try self.tokens.append(self.current_token.?);
