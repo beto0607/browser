@@ -5,8 +5,10 @@ const print = std.debug.print;
 const testing = std.testing;
 const unicode = std.unicode;
 
-const parser_stream = @import("./parser.stream.zig");
+const html_entities = @import("html_entities");
+
 const HTMLParserErrors = @import("./parser.errors.zig").HTMLParserErrors;
+const parser_stream = @import("./parser.stream.zig");
 const tokenizer_types = @import("./parser.tokenizer.types.zig");
 
 const HTMLTokenizer = struct {
@@ -20,7 +22,11 @@ const HTMLTokenizer = struct {
     current_attribute: ?tokenizer_types.TagAttribute,
     current_open_markup: std.ArrayList(u21),
     after_doctype_string: std.ArrayList(u21),
+    temp_buffer: std.ArrayList(u21),
     adjusted_current_node: bool,
+    html_entities_map: html_entities.EntitiesTree,
+    last_entity: ?html_entities.Entity,
+    character_reference_code: u64,
 
     const Self = @This();
 
@@ -36,7 +42,11 @@ const HTMLTokenizer = struct {
             .current_attribute = null,
             .current_open_markup = std.ArrayList(u21).init(allocator),
             .after_doctype_string = std.ArrayList(u21).init(allocator),
+            .temp_buffer = std.ArrayList(u21).init(allocator),
             .adjusted_current_node = false,
+            .html_entities_map = html_entities.EntitiesTree.init(allocator),
+            .last_entity = null,
+            .character_reference_code = 0,
         };
     }
 
@@ -68,6 +78,102 @@ const HTMLTokenizer = struct {
                         try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
                     },
                     else => {
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
+                    },
+                }
+            },
+            .rcdata => {
+                if (item.eof) { // EOF
+                    //     Emit an end-of-file token.
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x0026, //AMPERSAND (&)
+                    => { // Set the return state to the RCDATA state. Switch to the character reference state.
+                        self.return_state = .rcdata;
+                        self.state = .character_reference;
+                    },
+                    0x003C, //LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the RCDATA less-than sign state.
+                        self.state = .rcdata_less_than_sign;
+                    },
+                    0x0000, //NULL
+                    => {
+                        //     This is an unexpected-null-character parse error. Emit a 0xFFFD REPLACEMENT CHARACTER character token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        try self.emitToken(.{ .character = .{ .data = 0xfffd } }, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit the current input character as a character token.
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
+                    },
+                }
+            },
+            .rawtext => {
+                if (item.eof) { // EOF
+                    //     Emit an end-of-file token.
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x003C, //LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the RAWTEXT less-than sign state.
+                        self.state = .rawtext_less_than_sign;
+                    },
+                    0x0000, //NULL
+                    => {
+                        //     This is an unexpected-null-character parse error. Emit a 0xFFFD REPLACEMENT CHARACTER character token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        try self.emitToken(.{ .character = .{ .data = 0xfffd } }, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit the current input character as a character token.
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
+                    },
+                }
+            },
+            .script_data => {
+                if (item.eof) { // EOF
+                    //     Emit an end-of-file token.
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x003C, //LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the script data less-than sign state.
+                        self.state = .script_data_less_than_sign;
+                    },
+                    0x0000, //NULL
+                    => {
+                        //     This is an unexpected-null-character parse error. Emit a 0xFFFD REPLACEMENT CHARACTER character token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        try self.emitToken(.{ .character = .{ .data = 0xfffd } }, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit the current input character as a character token.
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
+                    },
+                }
+            },
+            .plaintext => {
+                if (item.eof) { // EOF
+                    //     Emit an end-of-file token.
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x0000, //NULL
+                    => {
+                        //     This is an unexpected-null-character parse error. Emit a 0xFFFD REPLACEMENT CHARACTER character token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        try self.emitToken(.{ .character = .{ .data = 0xfffd } }, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit the current input character as a character token.
                         try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
                     },
                 }
@@ -184,6 +290,885 @@ const HTMLTokenizer = struct {
                     },
                     else => {
                         try self.appendCharacterToCurrentTagName(item.code_point);
+                    },
+                }
+            },
+            .rcdata_less_than_sign => {
+                switch (item.code_point) {
+                    0x002F, //SOLIDUS (/)
+                    => {
+                        //     Set the temporary buffer to the empty string.
+                        //     Switch to the RCDATA end tag open state.
+                        try self.temp_buffer.clearRetainingCapacity();
+                        self.state = .rcdata_end_tag_open;
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x003C LESS-THAN SIGN character token. Reconsume in the RCDATA state.
+                        try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                        self.state = .rcdata_end_tag_open;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .rcdata_end_tag_open => {
+                switch (item.code_point) {
+                    0x0041...0x005a, // ASCII upper alpha
+                    0x0061...0x007a, // ASCII lower alpha
+                    => { // ASCII alpha
+                        //     Create a new end tag token, set its tag name to
+                        //     the empty string. Reconsume in the RCDATA end tag name state.
+                        self.current_token = .{ .end_tag = .{ .name = [_]u21{} } };
+                        self.state = .rcdata_end_tag_name;
+                        try self.consumeItem(item, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x003C LESS-THAN SIGN character token and a 0x002F SOLIDUS character token. Reconsume in the RCDATA state.
+                        try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                        try self.emitToken(.{ .character = .{ .data = 0x002f } }, sink);
+                        self.state = .rcdata;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .rcdata_end_tag_name => {
+                switch (item.code_point) {
+                    0x0009, //CHARACTER TABULATION (tab)
+                    0x000A, //LINE FEED (LF)
+                    0x000C, //FORM FEED (FF)
+                    0x0020, //SPACE
+                    => {
+                        //     If the current end tag token is an appropriate end tag token,
+                        //     then switch to the before attribute name state. Otherwise,
+                        //     treat it as per the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .before_attribute_name;
+                            return;
+                        }
+                    },
+                    0x002F, //SOLIDUS (/)
+                    => {
+                        //     If the current end tag token is an appropriate end tag token,
+                        //     then switch to the self-closing start tag state. Otherwise,
+                        //     treat it as per the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .self_closing_start_tag;
+                            return;
+                        }
+                    },
+                    0x003E, //GREATER-THAN SIGN (>)
+                    => {
+                        //     If the current end tag token is an appropriate end tag token,
+                        //     then switch to the data state and emit the current tag token.
+                        //     Otherwise, treat it as per the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .data;
+                            try self.emitCurrentToken(sink);
+                            return;
+                        }
+                    },
+                    0x0041...0x005a, // ASCII upper alpha
+                    => {
+                        //     Append the lowercase version of the current input character
+                        //     (add 0x0020 to the character's code point) to the current
+                        //     tag token's tag name. Append the current input character
+                        //     to the temporary buffer.
+                        try self.appendCharacterToCurrentTagName(item.code_point + 0x0020);
+                        try self.temp_buffer.append(item.code_point);
+                        return;
+                    },
+                    0x0061...0x007a, // ASCII lower alpha
+                    => {
+                        //     Append the current input character to the current tag
+                        //     token's tag name. Append the current input character
+                        //     to the temporary buffer.
+                        try self.appendCharacterToCurrentTagName(item.code_point);
+                        try self.temp_buffer.append(item.code_point);
+                        return;
+                    },
+                    else => {
+                        // Anything else
+                    },
+                }
+                // Anything else
+                //     Emit a 0x003C LESS-THAN SIGN character token, a 0x002F
+                //     SOLIDUS character token, and a character token for each
+                //     of the characters in the temporary buffer (in the order
+                //     they were added to the buffer).
+                //     Reconsume in the RCDATA state.
+                try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                try self.emitToken(.{ .character = .{ .data = 0x002f } }, sink);
+                for (self.temp_buffer.items) |value| {
+                    try self.emitToken(.{ .character = .{ .data = value } }, sink);
+                }
+                self.state = .rcdata;
+                try self.consumeItem(item, sink);
+            },
+            .rawtext_less_than_sign => {
+                switch (item.code_point) {
+                    0x002F, // SOLIDUS (/)
+                    => {
+                        //     Set the temporary buffer to the empty string.
+                        //     Switch to the RAWTEXT end tag open state.
+                        self.temp_buffer.clearRetainingCapacity();
+                        self.state = .rawtext_end_tag_open;
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x003C LESS-THAN SIGN character token.
+                        //     Reconsume in the RAWTEXT state.
+                        try self.emitToken(.{ .character = .{ .data = 0x003C } }, sink);
+                        self.state = .rawtext;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .rawtext_end_tag_open => {
+                switch (item.code_point) {
+                    0x0041...0x005a, // ASCII upper alpha
+                    0x0061...0x007a, // ASCII lower alpha
+                    => { // ASCII alpha
+                        //     Create a new end tag token, set its tag name to the empty string.
+                        //     Reconsume in the RAWTEXT end tag name state.
+                        self.current_token = .{ .end_tag = .{
+                            .name = [_]u21{},
+                            .self_closing = false,
+                            .attributes = [_]tokenizer_types.TagAttribute{},
+                        } };
+                        self.state = .rawtext_end_tag_name;
+                        try self.consumeItem(item, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x003C LESS-THAN SIGN character token and a
+                        //     0x002F SOLIDUS character token. Reconsume in the RAWTEXT state.
+                        try self.emitToken(.{ .character = .{ .data = 0x003C } }, sink);
+                        try self.emitToken(.{ .character = .{ .data = 0x002f } }, sink);
+                        self.state = .rawtext;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .rawtext_end_tag_name => {
+                switch (item.code_point) {
+                    0x0009, // CHARACTER TABULATION (tab)
+                    0x000A, // LINE FEED (LF)
+                    0x000C, // FORM FEED (FF)
+                    0x0020, // SPACE
+                    => {
+                        //     If the current end tag token is an appropriate end tag token,
+                        //     then switch to the before attribute name state.
+                        //     Otherwise, treat it as per the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .before_attribute_name;
+                            return;
+                        }
+                    },
+                    0x002F, // SOLIDUS (/)
+                    => {
+                        //     If the current end tag token is an appropriate end
+                        //     tag token, then switch to the self-closing start
+                        //     tag state. Otherwise, treat it as per the
+                        //     "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .self_closing_start_tag;
+                            return;
+                        }
+                    },
+                    0x003E, // GREATER-THAN SIGN (>)
+                    => {
+                        //     If the current end tag token is an appropriate end
+                        //     tag token, then switch to the data state and emit
+                        //     the current tag token. Otherwise, treat it as per
+                        //     the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .data;
+                            try self.emitCurrentToken(sink);
+                            return;
+                        }
+                    },
+                    0x0041...0x005a, // ASCII upper alpha
+                    => {
+                        //     Append the lowercase version of the current input
+                        //     character (add 0x0020 to the character's code point)
+                        //     to the current tag token's tag name. Append the
+                        //     current input character to the temporary buffer.
+                        try self.appendCharacterToCurrentTagName(item.code_point + 0x0020);
+                        try self.temp_buffer.append(item.code_point);
+                        return;
+                    },
+                    0x0061...0x007a, // ASCII lower alpha
+                    => {
+                        //     Append the current input character to the current
+                        //     tag token's tag name. Append the current input
+                        //     character to the temporary buffer.
+                        try self.appendCharacterToCurrentTagName(item.code_point);
+                        try self.temp_buffer.append(item.code_point);
+                        return;
+                    },
+                    else => {
+                        //pass
+                    },
+                }
+                // Anything else
+                //     Emit a 0x003C LESS-THAN SIGN character token, a
+                //     0x002F SOLIDUS character token, and a character
+                //     token for each of the characters in the temporary
+                //     buffer (in the order they were added to the buffer).
+                //     Reconsume in the RAWTEXT state.
+                try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                try self.emitToken(.{ .character = .{ .data = 0x002f } }, sink);
+                for (self.temp_buffer.items) |value| {
+                    try self.emitToken(.{ .character = .{ .data = value } }, sink);
+                }
+                self.state = .rawtext;
+                try self.consumeItem(item, sink);
+            },
+            .script_data_less_than_sign => {
+                switch (item.code_point) {
+                    0x002F, // SOLIDUS (/)
+                    => {
+                        //     Set the temporary buffer to the empty string.
+                        //     Switch to the script data end tag open state.
+                        self.temp_buffer.clearRetainingCapacity();
+                        self.state = .script_data_end_tag_open;
+                    },
+                    0x0021, // EXCLAMATION MARK (!)
+                    => {
+                        //     Switch to the script data escape start state. Emit
+                        //     a 0x003C LESS-THAN SIGN character token and a
+                        //     0x0021 EXCLAMATION MARK character token.
+                        self.state = .script_data_escape_start;
+                        try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                        try self.emitToken(.{ .character = .{ .data = 0x0021 } }, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x003C LESS-THAN SIGN character token.
+                        //     Reconsume in the script data state.
+                        try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                        self.state = .script_data;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .script_data_end_tag_open => {
+                switch (item.code_point) {
+                    0x0041...0x005a, // ASCII upper alpha
+                    0x0061...0x007a, // ASCII lower alpha
+                    => { // ASCII alpha
+                        //     Create a new end tag token, set its tag name to
+                        //     the empty string. Reconsume in the script data
+                        //     end tag name state.
+                        self.current_token = .{ .end_tag = .{
+                            .name = [_]u21{},
+                            .self_closing = false,
+                            .attributes = [_]tokenizer_types.TagAttribute{},
+                        } };
+                        self.state = .script_data_end_tag_open;
+                        try self.consumeItem(item, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x003C LESS-THAN SIGN character token and
+                        //     a 0x002F SOLIDUS character token. Reconsume in
+                        //     the script data state.
+                        try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                        try self.emitToken(.{ .character = .{ .data = 0x002f } }, sink);
+                        self.state = .script_data;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .script_data_end_tag_name => {
+                switch (item.code_point) {
+                    0x0009, // CHARACTER TABULATION (tab)
+                    0x000A, // LINE FEED (LF)
+                    0x000C, // FORM FEED (FF)
+                    0x0020, // SPACE
+                    => {
+                        //     If the current end tag token is an appropriate
+                        //     end tag token, then switch to the before
+                        //     attribute name state. Otherwise, treat it as per
+                        //     the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .before_attribute_name;
+                            return;
+                        }
+                    },
+                    0x002F, // SOLIDUS (/)
+                    => {
+                        //     If the current end tag token is an appropriate
+                        //     end tag token, then switch to the self-closing
+                        //     start tag state. Otherwise, treat it as per the
+                        //     "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .self_closing_start_tag;
+                            return;
+                        }
+                    },
+                    0x003E, // GREATER-THAN SIGN (>)
+                    => {
+                        //     If the current end tag token is an appropriate
+                        //     end tag token, then switch to the data state and
+                        //     emit the current tag token. Otherwise, treat it
+                        //     as per the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .data;
+                            try self.emitCurrentToken(sink);
+                            return;
+                        }
+                    },
+                    0x0041...0x005a, // ASCII upper alpha
+                    => {
+                        //     Append the lowercase version of the current input
+                        //     character (add 0x0020 to the character's code
+                        //     point) to the current tag token's tag name.
+                        //     Append the current input character to the
+                        //     temporary buffer.
+                        try self.appendCharacterToCurrentTagName(item.code_point + 0x0020);
+                        try self.temp_buffer.append(item.code_point);
+                        return;
+                    },
+                    0x0061...0x007a, // ASCII lower alpha
+                    => {
+                        //     Append the current input character to the current
+                        //     tag token's tag name. Append the current input
+                        //     character to the temporary buffer.
+                        try self.appendCharacterToCurrentTagName(item.code_point);
+                        try self.temp_buffer.append(item.code_point);
+                        return;
+                    },
+                    else => {},
+                }
+                // Anything else
+                //     Emit a 0x003C LESS-THAN SIGN character token, a 0x002F
+                //     SOLIDUS character token, and a character token for each
+                //     of the characters in the temporary buffer (in the order
+                //     they were added to the buffer). Reconsume in the script
+                //     data state.
+                try self.emitToken(.{ .character = .{ .data = 0x003c } }, sink);
+                try self.emitToken(.{ .character = .{ .data = 0x002f } }, sink);
+                for (self.temp_buffer.items) |value| {
+                    try self.emitToken(.{ .character = .{ .data = value } }, sink);
+                }
+                self.state = .script_data;
+                try self.consumeItem(item, sink);
+            },
+            .script_data_escape_start => {
+                switch (item.code_point) {
+                    0x002D, // HYPHEN-MINUS (-)
+                    => {
+                        //     Switch to the script data escape start dash state.
+                        //     Emit a 0x002D HYPHEN-MINUS character token.
+                        self.state = .script_data_escape_start_dash;
+                        try self.emitToken(.{ .character = .{ .data = 0x002d } }, sink);
+                    },
+                    // Anything else
+                    else => {
+                        //     Reconsume in the script data state.
+                        self.state = .script_data;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .script_data_escape_start_dash => {
+                switch (item.code_point) {
+                    0x002D, // HYPHEN-MINUS (-)
+                    => {
+                        //     Switch to the script data escaped dash dash state.
+                        //     Emit a 0x002D HYPHEN-MINUS character token.
+                        self.state = .script_data_escaped_dash_dash;
+                        try self.emitToken(.{ .character = .{ .data = 0x002d } }, sink);
+                    },
+                    else => { // Anything else
+                        //     Reconsume in the script data state.
+                        self.state = .script_data;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .script_data_escaped => {
+                if (item.eof) { // EOF
+                    //     This is an eof-in-script-html-comment-like-text parse
+                    //     error. Emit an end-of-file token.
+                    try self.emitError(HTMLParserErrors.EOFInScriptHtmlCommentLikeText);
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x002D, // HYPHEN-MINUS (-)
+                    => {
+                        //     Switch to the script data escaped dash state.
+                        //     Emit a 0x002D HYPHEN-MINUS character token.
+                        self.state = .script_data_escaped_dash;
+                        try self.emitToken(.{ .character = .{ .data = 0x002d } }, sink);
+                    },
+                    0x003C, // LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the script data escaped less-than sign state.
+                        self.state = .script_data_escaped_less_than_sign;
+                    },
+                    0x0000, // NULL
+                    => {
+                        //     This is an unexpected-null-character parse error.
+                        //     Emit a 0xFFFD REPLACEMENT CHARACTER character token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        try self.emitToken(.{ .character = .{ .data = 0xfffd } }, sink);
+                    },
+                    // Anything else
+                    else => {
+                        //     Emit the current input character as a character token.
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
+                    },
+                }
+            },
+            .script_data_escaped_dash => {
+                if (item.eof) { // EOF
+                    //     This is an eof-in-script-html-comment-like-text parse
+                    //     error. Emit an end-of-file token.
+                    try self.emitError(HTMLParserErrors.EOFInScriptHtmlCommentLikeText);
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x002D, // HYPHEN-MINUS (-)
+                    => {
+                        //     Switch to the script data escaped dash dash state.
+                        //     Emit a 0x002D HYPHEN-MINUS character token.
+                        self.state = .script_data_escaped_dash_dash;
+                        try self.emitToken(.{ .character = .{ .data = 0x002d } }, sink);
+                    },
+                    0x003C, // LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the script data escaped less-than sign state.
+                        self.state = .script_data_escaped_less_than_sign;
+                    },
+                    0x0000, // NULL
+                    => {
+                        //     This is an unexpected-null-character parse error.
+                        //     Switch to the script data escaped state. Emit a
+                        //     0xFFFD REPLACEMENT CHARACTER character token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        self.state = .script_data_escaped;
+                        try self.emitToken(.{ .character = .{ .data = 0xfffd } }, sink);
+                    },
+                    else => { // Anything else
+                        //     Switch to the script data escaped state. Emit the
+                        //     current input character as a character token.
+                        self.state = .script_data_escaped;
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
+                    },
+                }
+            },
+            .script_data_escaped_dash_dash => {
+                if (item.eof) { // EOF
+                    //     This is an eof-in-script-html-comment-like-text parse
+                    //     error. Emit an end-of-file token.
+                    try self.emitError(HTMLParserErrors.EOFInScriptHtmlCommentLikeText);
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x002D, // HYPHEN-MINUS (-)
+                    => {
+                        //     Emit a 0x002D HYPHEN-MINUS character token.
+                        try self.emitToken(.{ .character = .{ .data = 0x002d } }, sink);
+                    },
+                    0x003C, // LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the script data escaped less-than sign
+                        //     state.
+                        self.state = .script_data_escaped_less_than_sign;
+                    },
+                    0x003E, // GREATER-THAN SIGN (>)
+                    => {
+                        //     Switch to the script data state. Emit a 0x003E
+                        //     GREATER-THAN SIGN character token.
+                        self.state = .script_data;
+                        try self.emitToken(.{ .character = .{ .data = 0x003e } }, sink);
+                    },
+                    0x0000, // NULL
+                    => {
+                        //     This is an unexpected-null-character parse error.
+                        //     Switch to the script data escaped state. Emit a
+                        //     0xFFFD REPLACEMENT CHARACTER character token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        self.state = .script_data_escaped;
+                        try self.emitToken(.{ .character = .{ .data = 0xfffd } }, sink);
+                    },
+                    else => { // Anything else
+                        //     Switch to the script data escaped state. Emit the
+                        //     current input character as a character token.
+                        self.state = .script_data_escaped;
+                        try self.emitToken(.{ .character = .{ .data = item.code_point } }, sink);
+                    },
+                }
+            },
+            .script_data_escaped_less_than_sign => {
+                switch (item.code_point) {
+                    0x002F, // SOLIDUS (/)
+                    => {
+                        //     Set the temporary buffer to the empty string.
+                        //     Switch to the script data escaped end tag open state.
+                        self.temp_buffer.clearRetainingCapacity();
+                        self.state = .script_data_escaped_end_tag_open;
+                    },
+                    0x0041...0x005a, // ASCII upper alpha
+                    0x0061...0x007a, // ASCII lower alpha
+                    => { // ASCII alpha
+                        //     Set the temporary buffer to the empty string.
+                        //     Emit a 0x003C LESS-THAN SIGN character token.
+                        //     Reconsume in the script data double escape start
+                        //     state.
+                        self.temp_buffer.clearRetainingCapacity();
+                        try self.emitCharacterToken(0x003c, sink);
+                        self.state = .script_data_double_escape_start;
+                        try self.consumeItem(item, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x003C LESS-THAN SIGN character token.
+                        //     Reconsume in the script data escaped state.
+                        try self.emitCharacterToken(0x003c, sink);
+                        self.state = .script_data_escaped;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .script_data_escaped_end_tag_open => {
+                switch (item.code_point) {
+                    0x0041...0x005a, // ASCII upper alpha
+                    0x0061...0x007a, // ASCII lower alpha
+                    => { // ASCII alpha
+                        //     Create a new end tag token, set its tag name to
+                        //     the empty string. Reconsume in the script data
+                        //     escaped end tag name state.
+                        self.current_token = .{ .end_tag = .{
+                            .name = [_]u21{},
+                            .self_closing = false,
+                            .attributes = [_]tokenizer_types.TagAttribute{},
+                        } };
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x003C LESS-THAN SIGN character token and
+                        //     a 0x002F SOLIDUS character token. Reconsume in
+                        //     the script data escaped state.
+                        try self.emitCharacterToken(0x003c, sink);
+                        try self.emitCharacterToken(0x002f, sink);
+                        self.state = .script_data_escaped;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .script_data_escaped_end_tag_name => {
+                switch (item.code_point) {
+                    0x0009, // CHARACTER TABULATION (tab)
+                    0x000A, // LINE FEED (LF)
+                    0x000C, // FORM FEED (FF)
+                    0x0020, // SPACE
+                    => {
+                        //     If the current end tag token is an appropriate
+                        //     end tag token, then switch to the before
+                        //     attribute name state. Otherwise, treat it as per
+                        //     the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .before_attribute_name;
+                            return;
+                        }
+                    },
+                    0x002F, // SOLIDUS (/)
+                    => {
+                        //     If the current end tag token is an appropriate
+                        //     end tag token, then switch to the self-closing
+                        //     start tag state. Otherwise, treat it as per the
+                        //     "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .self_closing_start_tag;
+                            return;
+                        }
+                    },
+                    0x003E, // GREATER-THAN SIGN (>)
+                    => {
+                        //     If the current end tag token is an appropriate
+                        //     end tag token, then switch to the data state and
+                        //     emit the current tag token. Otherwise, treat it
+                        //     as per the "anything else" entry below.
+                        if (self.isCurrentEndTagAppropiate()) {
+                            self.state = .data;
+                            try self.emitCurrentToken(sink);
+                            return;
+                        }
+                    },
+                    0x0041...0x005a, // ASCII upper alpha
+                    => {
+                        //     Append the lowercase version of the current input
+                        //     character (add 0x0020 to the character's code
+                        //     point) to the current tag token's tag name.
+                        //     Append the current input character to the
+                        //     temporary buffer.
+                        try self.appendCharacterToCurrentTagName(item.code_point + 0x0020);
+                        try self.temp_buffer.append(item.code_point);
+                        return;
+                    },
+                    0x0061...0x007a, // ASCII lower alpha
+                    => {
+                        //     Append the current input character to the current
+                        //     tag token's tag name. Append the current input
+                        //     character to the temporary buffer.
+                        try self.appendCharacterToCurrentTagName(item.code_point);
+                        try self.temp_buffer.append(item.code_point);
+                        return;
+                    },
+                    else => {},
+                }
+                // Anything else
+                //     Emit a 0x003C LESS-THAN SIGN character token, a 0x002F
+                //     SOLIDUS character token, and a character token for each
+                //     of the characters in the temporary buffer (in the order
+                //     they were added to the buffer). Reconsume in the script
+                //     data escaped state.
+                try self.emitCharacterToken(0x003c, sink);
+                try self.emitCharacterToken(0x002f, sink);
+                for (self.temp_buffer.items) |value| {
+                    try self.emitCharacterToken(value, sink);
+                }
+                self.state = .script_data_escaped;
+                try self.consumeItem(item, sink);
+            },
+            .script_data_double_escape_start => {
+                switch (item.code_point) {
+                    0x0009, // CHARACTER TABULATION (tab)
+                    0x000A, // LINE FEED (LF)
+                    0x000C, // FORM FEED (FF)
+                    0x0020, // SPACE
+                    0x002F, // SOLIDUS (/)
+                    0x003E, // GREATER-THAN SIGN (>)
+                    => {
+                        //     If the temporary buffer is the string "script",
+                        //     then switch to the script data double escaped
+                        //     state. Otherwise, switch to the script data
+                        //     escaped state. Emit the current input character
+                        //     as a character token.
+                        const script_string = [_]u21{ 0x73, 0x63, 0x72, 0x69, 0x70, 0x74 };
+                        if (mem.eql(u21, self.temp_buffer.items, script_string)) {
+                            self.state = .script_data_double_escaped;
+                        } else {
+                            self.state = .script_data_escaped;
+                        }
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                    0x0041...0x005a, // ASCII upper alpha
+                    => {
+                        //     Append the lowercase version of the current input
+                        //     character (add 0x0020 to the character's code
+                        //     point) to the temporary buffer. Emit the current
+                        //     input character as a character token.
+                        try self.temp_buffer.append(item.code_point + 0x0020);
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                    0x0061...0x007a, // ASCII lower alpha
+                    => {
+                        //     Append the current input character to the
+                        //     temporary buffer. Emit the current input
+                        //     character as a character token.
+                        try self.temp_buffer.append(item.code_point);
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                    else => { // Anything else
+                        //     Reconsume in the script data escaped state.
+                        self.state = .script_data_escaped;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .script_data_double_escaped => {
+                if (item.eof) { // EOF
+                    //     This is an eof-in-script-html-comment-like-text parse
+                    //     error. Emit an end-of-file token.
+                    try self.emitError(HTMLParserErrors.EOFInScriptHtmlCommentLikeText);
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x002D, // HYPHEN-MINUS (-)
+                    => {
+                        //     Switch to the script data double escaped dash
+                        //     state. Emit a 0x002D HYPHEN-MINUS character
+                        //     token.
+                        self.state = .script_data_double_escaped_dash;
+                        try self.emitCharacterToken(0x002d, sink);
+                    },
+                    0x003C, // LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the script data double escaped
+                        //     less-than sign state. Emit a 0x003C LESS-THAN
+                        //     SIGN character token.
+                        self.state = .script_data_double_escaped_less_than_sign;
+                        try self.emitCharacterToken(0x003c, sink);
+                    },
+                    0x0000, // NULL
+                    => {
+                        //     This is an unexpected-null-character parse error.
+                        //     Emit a 0xFFFD REPLACEMENT CHARACTER character
+                        //     token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        try self.emitCharacterToken(0xfffd, sink);
+                    },
+                    else => { // Anything else
+                        //     Emit the current input character as a character token.
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                }
+            },
+            .script_data_double_escaped_dash => {
+                if (item.eof) { // EOF
+                    //     This is an eof-in-script-html-comment-like-text parse
+                    //     error. Emit an end-of-file token.
+                    try self.emitError(HTMLParserErrors.EOFInScriptHtmlCommentLikeText);
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x002D, // HYPHEN-MINUS (-)
+                    => {
+                        //     Switch to the script data double escaped dash
+                        //     dash state. Emit a 0x002D HYPHEN-MINUS character
+                        //     token.
+                        self.state = .script_data_double_escaped_dash_dash;
+                        try self.emitCharacterToken(0x002d, sink);
+                    },
+                    0x003C, // LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the script data double escaped
+                        //     less-than sign state. Emit a 0x003C LESS-THAN
+                        //     SIGN character token.
+                        self.state = .script_data_double_escaped_less_than_sign;
+                        try self.emitCharacterToken(0x003c, sink);
+                    },
+                    0x0000, // NULL
+                    => {
+                        //     This is an unexpected-null-character parse error.
+                        //     Switch to the script data double escaped state.
+                        //     Emit a 0xFFFD REPLACEMENT CHARACTER character
+                        //     token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        self.state = .script_data_double_escaped;
+                        try self.emitCharacterToken(0xfffd, sink);
+                    },
+                    // Anything else
+                    else => {
+                        //     Switch to the script data double escaped state.
+                        //     Emit the current input character as a character
+                        //     token.
+                        self.state = .script_data_double_escaped;
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                }
+            },
+            .script_data_double_escaped_dash_dash => {
+                if (item.eof) { // EOF
+                    //     This is an eof-in-script-html-comment-like-text parse
+                    //     error. Emit an end-of-file token.
+                    try self.emitError(HTMLParserErrors.EOFInScriptHtmlCommentLikeText);
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x002D, // HYPHEN-MINUS (-)
+                    => {
+                        //     Emit a 0x002D HYPHEN-MINUS character token.
+                        try self.emitCharacterToken(0x002d, sink);
+                    },
+                    0x003C, // LESS-THAN SIGN (<)
+                    => {
+                        //     Switch to the script data double escaped
+                        //     less-than sign state. Emit a 0x003C LESS-THAN
+                        //     SIGN character token.
+                        self.state = .script_data_escaped_less_than_sign;
+                        try self.emitCharacterToken(0x003c, sink);
+                    },
+                    0x003E, // GREATER-THAN SIGN (>)
+                    => {
+                        //     Switch to the script data state. Emit a 0x003E
+                        //     GREATER-THAN SIGN character token.
+                        self.state = .script_data;
+                        try self.emitCharacterToken(0x003e, sink);
+                    },
+                    0x0000, // NULL
+                    => {
+                        //     This is an unexpected-null-character parse error.
+                        //     Switch to the script data double escaped state.
+                        //     Emit a 0xFFFD REPLACEMENT CHARACTER character
+                        //     token.
+                        try self.emitError(HTMLParserErrors.UnexpectedNullCharacter);
+                        self.state = .script_data_double_escaped;
+                        try self.emitCharacterToken(0xfffd, sink);
+                    },
+                    else => {
+                        // Anything else
+                        //     Switch to the script data double escaped state.
+                        //     Emit the current input character as a character token.
+                        self.state = .script_data_double_escaped;
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                }
+            },
+            .script_data_double_escaped_less_than_sign => {
+                switch (item.code_point) {
+                    0x002F, // SOLIDUS (/)
+                    => {
+                        //     Set the temporary buffer to the empty string.
+                        //     Switch to the script data double escape end state.
+                        //     Emit a 0x002F SOLIDUS character token.
+                        self.temp_buffer.clearRetainingCapacity();
+                        self.state = .script_data_double_escape_end;
+                        try self.emitCharacterToken(0x002f, sink);
+                    },
+                    else => { // Anything else
+                        //     Reconsume in the script data double escaped state.
+                        self.state = .script_data_double_escaped;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .script_data_double_escape_end => {
+                switch (item.code_point) {
+                    0x0009, // CHARACTER TABULATION (tab)
+                    0x000A, // LINE FEED (LF)
+                    0x000C, // FORM FEED (FF)
+                    0x0020, // SPACE
+                    0x002F, // SOLIDUS (/)
+                    0x003E, // GREATER-THAN SIGN (>)
+                    => {
+                        //     If the temporary buffer is the string "script",
+                        //     then switch to the script data escaped state.
+                        //     Otherwise, switch to the script data double
+                        //     escaped state. Emit the current input character
+                        //     as a character token.
+                        const script_string = [_]u21{ 0x73, 0x63, 0x72, 0x69, 0x70, 0x74 };
+                        if (mem.eql(u21, self.temp_buffer.items, script_string)) {
+                            self.state = .script_data_escaped;
+                        } else {
+                            self.state = .script_data_double_escaped;
+                        }
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                    0x0041...0x005a, // ASCII upper alpha
+                    => {
+                        //     Append the lowercase version of the current input
+                        //     character (add 0x0020 to the character's code
+                        //     point) to the temporary buffer. Emit the current
+                        //     input character as a character token.
+                        try self.temp_buffer.append(item.code_point + 0x0020);
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                    0x0061...0x007a, // ASCII lower alpha
+                    => {
+                        //     Append the current input character to the
+                        //     temporary buffer. Emit the current input
+                        //     character as a character token.
+                        try self.temp_buffer.append(item.code_point);
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                    else => { // Anything else
+                        //     Reconsume in the script data double escaped state.
+                        self.state = .script_data_double_escaped;
+                        try self.consumeItem(item, sink);
                     },
                 }
             },
@@ -1505,6 +2490,490 @@ const HTMLTokenizer = struct {
                     },
                 }
             },
+            .cdata_section => {
+                if (item.eof) { // EOF
+                    //     This is an eof-in-cdata parse error.
+                    //     Emit an end-of-file token.
+                    try self.emitError(HTMLParserErrors.EOFInCdata);
+                    try self.emitEOFToken(sink);
+                    return;
+                }
+                switch (item.code_point) {
+                    0x005D, // RIGHT SQUARE BRACKET (])
+                    => {
+                        //     Switch to the CDATA section bracket state.
+                        self.state = .cdata_section_bracket;
+                    },
+                    else => { // Anything else
+                        //     Emit the current input character as a character token
+                        try self.emitCharacterToken(item.code_point, sink);
+                    },
+                }
+            },
+            .cdata_section_bracket => {
+                switch (item.code_point) {
+                    0x005D, // RIGHT SQUARE BRACKET (])
+                    => {
+                        //     Switch to the CDATA section end state.
+                        self.state = .cdata_section_end;
+                    },
+                    else => { // Anything else
+                        //     Emit a 0x005D RIGHT SQUARE BRACKET character
+                        //     token. Reconsume in the CDATA section state.
+                        try self.emitCharacterToken(0x005d, sink);
+                        self.state = .cdata_section;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .cdata_section_end => {
+                switch (item.code_point) {
+                    0x005D, // RIGHT SQUARE BRACKET (])
+                    => {
+                        //     Emit a 0x005D RIGHT SQUARE BRACKET character
+                        //     token.
+                        try self.emitCharacterToken(0x005d, sink);
+                    },
+                    0x003E, // GREATER-THAN SIGN (>)
+                    => {
+                        //     Switch to the data state.
+                        self.state = .data;
+                    },
+                    else => { // Anything else
+                        //     Emit two 0x005D RIGHT SQUARE BRACKET character
+                        //     tokens. Reconsume in the CDATA section state.
+                        try self.emitCharacterToken(0x005d, sink);
+                        try self.emitCharacterToken(0x005d, sink);
+                        self.state = .cdata_section;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .character_reference => {
+                // Set the temporary buffer to the empty string. Append a 0x0026
+                // AMPERSAND (&) character to the temporary buffer. Consume the
+                // next input character:
+                self.temp_buffer.clearRetainingCapacity();
+                try self.temp_buffer.append(0x0026);
+
+                switch (item.code_point) {
+                    0x0041...0x005a, // ASCII upper alpha
+                    0x0061...0x007a, // ASCII lower alpha
+                    0x0030...0x0039, // ASCII digit
+                    => { // ASCII alphanumeric
+                        //     Reconsume in the named character reference state.
+                        self.state = .named_character_reference;
+                        try self.consumeItem(item, sink);
+                    },
+                    0x0023, // NUMBER SIGN (#)
+                    => {
+                        //     Append the current input character to the
+                        //     temporary buffer. Switch to the numeric character
+                        //     reference state.
+                        try self.temp_buffer.append(self.current_character.?.code_point); //?maybe?
+                        self.state = .numeric_character_reference;
+                    },
+                    else => { // Anything else
+                        //     Flush code points consumed as a character
+                        //     reference. Reconsume in the return state.
+                        try self.flushCodePoints(sink);
+                        self.state = self.return_state;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .named_character_reference => { // TODO: test this shit
+                // Consume the maximum number of characters possible, where the
+                // consumed characters are one of the identifiers in the first
+                // column of the named character references table. Append each
+                // character to the temporary buffer when it's consumed.
+                try self.temp_buffer.append(item.code_point);
+                const entity_name = try self.tempBufferToString();
+                defer self.allocator.free(entity_name);
+
+                if (self.html_entities_map.getNamedEntity(entity_name)) |node| {
+                    self.last_entity = node.value.?;
+                    return;
+                } else if (self.html_entities_map.getNamedEntity(entity_name[0 .. entity_name.len - 1])) |node| {
+                    // If there is a match
+                    //
+                    //     If the character reference was consumed as part of an
+                    //     attribute, and the last character matched is not a 0x003B
+                    //     SEMICOLON character (;), and the next input character is
+                    //     either a 0x003D EQUALS SIGN character (=) or an ASCII
+                    //     alphanumeric, then, for historical reasons, flush code
+                    //     points consumed as a character reference and switch to
+                    //     the return state.
+                    const consumed_as_part_of_attribute = switch (self.return_state) {
+                        .attribute_value_double_quoted,
+                        .attribute_value_single_quoted,
+                        .attribute_value_unquoted,
+                        => true,
+                        else => false,
+                    };
+                    const is_last_char_semicolon = self.temp_buffer.items[self.temp_buffer.items.len - 1] == 0x003B;
+                    const next_input_is_equals_or_alpha = switch (item.code_point) {
+                        0x0041...0x005a, // ASCII upper alpha
+                        0x0061...0x007a, // ASCII lower alpha
+                        0x0030...0x0039, // ASCII digit
+                        0x003D, // EQUALS SIGN (=)
+                        => true,
+
+                        else => false,
+                    };
+                    if (consumed_as_part_of_attribute and
+                        !is_last_char_semicolon and
+                        next_input_is_equals_or_alpha)
+                    {
+                        //     ...then, for historical reasons, flush code
+                        //     points consumed as a character reference and
+                        //     switch to the return state.
+                        try self.flushCodePoints(sink);
+                        self.state = self.return_state;
+                        return;
+                    }
+                    //     Otherwise:
+                    //         If the last character matched is not a 0x003B
+                    //         SEMICOLON character (;), then this is a
+                    //         missing-semicolon-after-character-reference parse
+                    //         error.
+                    if (!is_last_char_semicolon) {
+                        try self.emitError(HTMLParserErrors.MissingSemicolonAfterCharacterReference);
+                    }
+                    //         Set the temporary buffer to the empty string.
+                    //         Append one or two characters corresponding to the
+                    //         character reference name (as given by the second
+                    //         column of the named character references table)
+                    //         to the temporary buffer.
+                    self.temp_buffer.clearRetainingCapacity();
+                    for (node.value.?.codepoints) |codepoints| {
+                        try self.temp_buffer.append(codepoints);
+                    }
+                    //         Flush code points consumed as a character
+                    //         reference. Switch to the return state.
+                    try self.flushCodePoints(sink);
+                    self.state = self.return_state;
+                } else {
+                    // Otherwise
+                    //     Flush code points consumed as a character reference.
+                    //     Switch to the ambiguous ampersand state.
+                    try self.flushCodePoints(sink);
+                    self.state = .ambiguous_ampersand;
+                }
+            },
+            .ambiguous_ampersand => {
+                switch (item.code_point) {
+                    0x0041...0x005a, // ASCII upper alpha
+                    0x0061...0x007a, // ASCII lower alpha
+                    0x0030...0x0039, // ASCII digit
+                    => { // ASCII alphanumeric
+                        //     If the character reference was consumed as part
+                        //     of an attribute, then append the current input
+                        //     character to the current attribute's value.
+                        //     Otherwise, emit the current input character as a
+                        //     character token.
+                        switch (self.return_state) {
+                            // consumed as part of an attribute
+                            .attribute_value_double_quoted,
+                            .attribute_value_single_quoted,
+                            .attribute_value_unquoted,
+                            => {
+                                try self.appendCharacterToCurrentAttributeValue(self.current_character.?.code_point);
+                            },
+                            else => {
+                                try self.emitCharacterToken(self.current_character.?.code_point, sink);
+                            },
+                        }
+                    },
+                    0x003B, // 0x003B SEMICOLON (;)
+                    => {
+                        //     This is an unknown-named-character-reference
+                        //     parse error. Reconsume in the return state.
+                        try self.emitError(HTMLParserErrors.UnknownNamedCharacterReference);
+                        self.state = self.return_state;
+                        try self.consumeItem(item, sink);
+                    },
+                    else => { // Anything else
+                        //     Reconsume in the return state.
+                        self.state = self.return_state;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .numeric_character_reference => {
+                // Set the character reference code to zero (0).
+                self.character_reference_code = 0;
+                switch (item.code_point) {
+                    0x0078, // 0x0078 LATIN SMALL LETTER X
+                    0x0058, // 0x0058 LATIN CAPITAL LETTER X
+                    => {
+                        //     Append the current input character to the
+                        //     temporary buffer. Switch to the hexadecimal
+                        //     character reference start state.
+                        try self.temp_buffer.append(self.current_character.?.code_point);
+                        self.state = .hexadecimal_character_reference_start;
+                    },
+                    else => { // Anything else
+                        //     Reconsume in the decimal character reference start
+                        //     state.
+                        self.state = .decimal_character_reference_start;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .hexadecimal_character_reference_start => {
+                switch (item.code_point) {
+                    0x0041...0x0046, // ASCII upper hex digit
+                    0x0061...0x0066, // ASCII lower hex digit
+                    0x0030...0x0039, // ASCII digit
+                    => { // ASCII hex digit
+                        //     Reconsume in the hexadecimal character reference
+                        //     state.
+                        self.state = .hexadecimal_character_reference;
+                        try self.consumeItem(item, sink);
+                    },
+                    else => {
+                        // Anything else
+                        //     This is an
+                        //     absence-of-digits-in-numeric-character-reference
+                        //     parse error. Flush code points consumed as a
+                        //     character reference. Reconsume in the return
+                        //     state.
+                        try self.emitError(HTMLParserErrors.AbsenceOfDigitsInNumericCharacterReference);
+                        try self.flushCodePoints(sink);
+                        self.state = self.return_state;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .decimal_character_reference_start => {
+                switch (item.code_point) {
+                    0x0030...0x0039, // ASCII digit
+                    => {
+                        //     Reconsume in the decimal character reference
+                        //     state.
+                        self.state = .decimal_character_reference;
+                        try self.consumeItem(item, sink);
+                    },
+                    else => {
+                        // Anything else
+                        //     This is an
+                        //     absence-of-digits-in-numeric-character-reference
+                        //     parse error. Flush code points consumed as a
+                        //     character reference. Reconsume in the return
+                        //     state.
+                        try self.emitError(HTMLParserErrors.AbsenceOfDigitsInNumericCharacterReference);
+                        try self.flushCodePoints(sink);
+                        self.state = self.return_state;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .hexadecimal_character_reference => {
+                switch (item.code_point) {
+                    0x0030...0x0039, // ASCII digit
+                    => {
+                        //     Multiply the character reference code by 16. Add
+                        //     a numeric version of the current input character
+                        //     (subtract 0x0030 from the character's code point)
+                        //     to the character reference code.
+                        self.character_reference_code *= 16;
+                        self.character_reference_code += item.code_point - 0x0030;
+                    },
+                    0x0041...0x0046, // ASCII upper hex digit
+                    => {
+                        //     Multiply the character reference code by 16. Add
+                        //     a numeric version of the current input character
+                        //     as a hexadecimal digit (subtract 0x0037 from the
+                        //     character's code point) to the character
+                        //     reference code.
+                        self.character_reference_code *= 16;
+                        self.character_reference_code += item.code_point - 0x0037;
+                    },
+                    0x0061...0x0066, // ASCII lower hex digit
+                    => {
+                        //     Multiply the character reference code by 16. Add
+                        //     a numeric version of the current input character
+                        //     as a hexadecimal digit (subtract 0x0057 from the
+                        //     character's code point) to the character
+                        //     reference code.
+                        self.character_reference_code *= 16;
+                        self.character_reference_code += item.code_point - 0x0057;
+                    },
+                    0x003B, // 0x003B SEMICOLON (;)
+                    => {
+                        //     Switch to the numeric character reference end state.
+                        self.state = .numeric_character_reference_end;
+                    },
+                    else => { // Anything else
+                        //     This is a
+                        //     missing-semicolon-after-character-reference parse
+                        //     error. Reconsume in the numeric character
+                        //     reference end state.
+                        try self.emitError(HTMLParserErrors.MissingSemicolonAfterCharacterReference);
+                        self.state = .numeric_character_reference_end;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .decimal_character_reference => {
+                switch (item.code_point) {
+                    0x0030...0x0039, // ASCII digit
+                    => {
+                        //     Multiply the character reference code by 10. Add
+                        //     a numeric version of the current input character
+                        //     (subtract 0x0030 from the character's code point)
+                        //     to the character reference code.
+                        self.character_reference_code *= 10;
+                        self.character_reference_code += item.code_point - 0x0030;
+                    },
+                    0x003B => {
+                        // 0x003B SEMICOLON (;)
+                        //     Switch to the numeric character reference end state.
+                        self.state = .numeric_character_reference_end;
+                    },
+                    else => {
+                        // Anything else
+                        //     This is a
+                        //     missing-semicolon-after-character-reference
+                        //     parse error. Reconsume in the numeric character
+                        //     reference end state.
+                        try self.emitError(HTMLParserErrors.MissingSemicolonAfterCharacterReference);
+                        self.state = .numeric_character_reference_end;
+                        try self.consumeItem(item, sink);
+                    },
+                }
+            },
+            .numeric_character_reference_end => {
+                // Check the character reference code:
+                switch (self.character_reference_code) {
+                    0x00 => {
+                        //     If the number is 0x00, then this is a
+                        //     null-character-reference parse error. Set the
+                        //     character reference code to 0xFFFD.
+                        try self.emitError(HTMLParserErrors.NullCharacterReference);
+                        self.character_reference_code = 0xfffd;
+                    },
+                    0x10FFFF...0xFFFFFFFFFFFFFFFF => {
+                        //     If the number is greater than 0x10FFFF, then this
+                        //     is a character-reference-outside-unicode-range
+                        //     parse error. Set the character reference code
+                        //     to 0xFFFD.
+                        try self.emitError(HTMLParserErrors.CharacterReferenceOutsideUnicodeRange);
+                        self.character_reference_code = 0xfffd;
+                    },
+                    0xd800...0xdbff, // leading surrogate
+                    0xdc00...0xdfff, // trailing surrogate
+                    => {
+                        //     If the number is a surrogate, then this is a
+                        //     surrogate-character-reference parse error. Set
+                        //     the character reference code to 0xFFFD.
+                        try self.emitError(HTMLParserErrors.SurrogateCharacterReference);
+                        self.character_reference_code = 0xfffd;
+                    },
+                    0xfdd0...0xfdef,
+                    0xFFFE,
+                    0xFFFF,
+                    0x1FFFE,
+                    0x1FFFF,
+                    0x2FFFE,
+                    0x2FFFF,
+                    0x3FFFE,
+                    0x3FFFF,
+                    0x4FFFE,
+                    0x4FFFF,
+                    0x5FFFE,
+                    0x5FFFF,
+                    0x6FFFE,
+                    0x6FFFF,
+                    0x7FFFE,
+                    0x7FFFF,
+                    0x8FFFE,
+                    0x8FFFF,
+                    0x9FFFE,
+                    0x9FFFF,
+                    0xAFFFE,
+                    0xAFFFF,
+                    0xBFFFE,
+                    0xBFFFF,
+                    0xCFFFE,
+                    0xCFFFF,
+                    0xDFFFE,
+                    0xDFFFF,
+                    0xEFFFE,
+                    0xEFFFF,
+                    0xFFFFE,
+                    0xFFFFF,
+                    0x10FFFE,
+                    0x10FFFF,
+                    => { // noncharacter
+                        //     If the number is a noncharacter, then this is a
+                        //     noncharacter-character-reference parse error.
+                        try self.emitError(HTMLParserErrors.NoncharacterCharacterReference);
+                    },
+                    0x0d,
+                    0x007F...0x009F, // c0 control
+                    0x0000...0x0009, // control - no whitespace
+                    0x0b, // control - no whitespace
+                    0x0c...0x001F, // control - no whitespace
+                    => {
+                        //     If the number is 0x0D, or a control that's not
+                        //     ASCII whitespace, then this is a
+                        //     control-character-reference parse error. If the
+                        //     number is one of the numbers in the first column
+                        //     of the following table, then find the row with
+                        //     that number in the first column, and set the
+                        //     character reference code to the number in the
+                        //     second column of that row.
+                        try self.emitError(HTMLParserErrors.ControlCharacterReference);
+                        const table_column_1 = [_]u64{ 0x80, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8E, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9E, 0x9F };
+                        const table_column_2 = [_]u21{
+                            0x20AC, // EURO SIGN (€)
+                            0x201A, // SINGLE LOW-9 QUOTATION MARK (‚)
+                            0x0192, // LATIN SMALL LETTER F WITH HOOK (ƒ)
+                            0x201E, // DOUBLE LOW-9 QUOTATION MARK („)
+                            0x2026, // HORIZONTAL ELLIPSIS (…)
+                            0x2020, // DAGGER (†)
+                            0x2021, // DOUBLE DAGGER (‡)
+                            0x02C6, // MODIFIER LETTER CIRCUMFLEX ACCENT (ˆ)
+                            0x2030, // PER MILLE SIGN (‰)
+                            0x0160, // LATIN CAPITAL LETTER S WITH CARON (Š)
+                            0x2039, // SINGLE LEFT-POINTING ANGLE QUOTATION MARK (‹)
+                            0x0152, // LATIN CAPITAL LIGATURE OE (Œ)
+                            0x017D, // LATIN CAPITAL LETTER Z WITH CARON (Ž)
+                            0x2018, // LEFT SINGLE QUOTATION MARK (‘)
+                            0x2019, // RIGHT SINGLE QUOTATION MARK (’)
+                            0x201C, // LEFT DOUBLE QUOTATION MARK (“)
+                            0x201D, // RIGHT DOUBLE QUOTATION MARK (”)
+                            0x2022, // BULLET (•)
+                            0x2013, // EN DASH (–)
+                            0x2014, // EM DASH (—)
+                            0x02DC, // SMALL TILDE (˜)
+                            0x2122, // TRADE MARK SIGN (™)
+                            0x0161, // LATIN SMALL LETTER S WITH CARON (š)
+                            0x203A, // SINGLE RIGHT-POINTING ANGLE QUOTATION MARK (›)
+                            0x0153, // LATIN SMALL LIGATURE OE (œ)
+                            0x017E, // LATIN SMALL LETTER Z WITH CARON (ž)
+                            0x0178, // LATIN CAPITAL LETTER Y WITH DIAERESIS (Ÿ)
+                        };
+                        inline for (table_column_1, 0..) |table_entry, index| {
+                            if (table_entry == self.character_reference_code) {
+                                self.character_reference_code = table_column_2[index];
+                                break;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+                // Set the temporary buffer to the empty string. Append a code
+                // point equal to the character reference code to the temporary
+                // buffer. Flush code points consumed as a character reference.
+                // Switch to the return state.
+                self.temp_buffer.clearRetainingCapacity();
+                try self.temp_buffer.append(@intCast(self.character_reference_code & 0x10ffff));
+                try self.flushCodePoints(sink);
+                self.state = self.return_state;
+            },
             else => {
                 print("current status was: {}\n", .{self.state});
                 // Not implemented yet
@@ -1519,6 +2988,10 @@ const HTMLTokenizer = struct {
         } };
         try sink(t);
         try self.tokens.append(t);
+    }
+
+    fn emitCharacterToken(self: *Self, character: u21, sink: tokenizer_types.TokenSink) !void {
+        try self.emitToken(.{ .character = .{ .data = character } }, sink);
     }
 
     fn emitToken(self: *Self, token: tokenizer_types.Token, sink: tokenizer_types.TokenSink) !void {
@@ -1653,10 +3126,29 @@ const HTMLTokenizer = struct {
         }
     }
 
-    fn handleIncorrectlyOpenedComment(self: *Self, sink: tokenizer_types.TokenSink) !void {
-        //Create a comment token whose data is the empty string. Switch to the bogus comment state (don't consume anything in the current state).
-        // TODO: emit incorrectly-opened-comment parse error.
+    fn flushCodePoints(self: *Self, sink: tokenizer_types.TokenSink) !void {
+        switch (self.return_state) {
+            // consumed as part of an attribute
+            .attribute_value_double_quoted,
+            .attribute_value_single_quoted,
+            .attribute_value_unquoted,
+            => {
+                for (self.temp_buffer.items) |value| {
+                    try self.appendCharacterToCurrentAttributeValue(value);
+                }
+            },
+            else => {
+                for (self.temp_buffer.items) |value| {
+                    try self.emitCharacterToken(value, sink);
+                }
+            },
+        }
+    }
 
+    fn handleIncorrectlyOpenedComment(self: *Self, sink: tokenizer_types.TokenSink) !void {
+        // Create a comment token whose data is the empty string. Switch to the
+        // bogus comment state (don't consume anything in the current state).
+        try self.emitError(HTMLParserErrors.IncorrectlyOpenedComment);
         self.current_token = .{ .comment = .{ .data = &[_]u21{} } };
         self.state = .comment_start;
         for (self.current_open_markup.items) |code_point| {
@@ -1671,6 +3163,37 @@ const HTMLTokenizer = struct {
         //TODO: create emition system
         _ = self; // autofix
         _ = parseError; // autofix
+    }
+
+    fn isCurrentEndTagAppropiate(self: *Self) bool {
+        if (self.current_token.?.end_tag) |end_tag| {
+            var i = self.tokens.items.len;
+
+            while (i > 0) : (i -= 1) {
+                const item = self.tokens.items[i - 1];
+
+                if (item.start_tag) |start_tag| {
+                    if (start_tag.self_closing) {
+                        continue;
+                    }
+                    return mem.eql(u21, item.start_tag.name, end_tag.name);
+                }
+            }
+
+            return false;
+        }
+        return false;
+    }
+
+    fn tempBufferToString(self: *Self) ![]const u8 {
+        var buff = std.ArrayList(u8).init(self.allocator);
+        defer buff.deinit();
+        try buff.ensureTotalCapacityPrecise(self.temp_buffer.items.len);
+
+        for (self.temp_buffer.items) |item| {
+            buff.append(@intCast(item & 0xff));
+        }
+        return try buff.toOwnedSlice();
     }
 };
 
