@@ -1,5 +1,6 @@
 const std = @import("std");
 const io = std.io;
+const mem = std.mem;
 const print = std.debug.print;
 const testing = std.testing;
 const unicode = std.unicode;
@@ -15,21 +16,24 @@ pub const HTMLParserInputStream = struct {
     reader: io.AnyReader,
 
     state_flags: InputStreamStateFlags,
-    last_item: *InputStreamItem,
+    last_item: ?*InputStreamItem,
 
     index: u64,
     eof_sent: bool,
 
+    allocator: mem.Allocator,
+
     const Self = @This();
-    pub fn init(reader: io.AnyReader) HTMLParserInputStream {
+    pub fn init(allocator: mem.Allocator, reader: io.AnyReader) HTMLParserInputStream {
         return .{
             .character_encoding = .UTF_8,
             .confidence = .certain,
             .reader = reader,
             .state_flags = .{ .replaced_cr_lf = false },
-            .last_item = undefined,
+            .last_item = null,
             .index = 0,
             .eof_sent = false,
+            .allocator = allocator,
         };
     }
 
@@ -37,22 +41,35 @@ pub const HTMLParserInputStream = struct {
         if (self.eof_sent) {
             return null;
         }
+        var token = try self.allocator.create(InputStreamItem);
         self.index += 1;
         const byte = self.reader.readByte() catch {
             self.eof_sent = true;
-            return InputStreamItem{ .eof = true, .byte = 0, .code_point = 0 };
+            token.eof = true;
+            token.code_point = 0;
+            if (self.last_item != null) {
+                self.allocator.destroy(self.last_item.?);
+            }
+            self.last_item = token;
+            return token.*;
         };
         // TODO: add encoding here
         const code_point = self.getCodePoint(byte) catch return null;
 
-        var token = InputStreamItem{
-            .byte = byte,
-            .code_point = code_point,
-            .eof = false,
-        };
+        token.code_point = code_point;
+        token.eof = false;
 
-        self.last_item = &token;
-        return token;
+        if (self.last_item != null) {
+            self.allocator.destroy(self.last_item.?);
+        }
+        self.last_item = token;
+        return token.*;
+    }
+
+    pub fn destroy(self: *Self) void {
+        if (self.last_item != null) {
+            self.allocator.destroy(self.last_item.?);
+        }
     }
 
     fn getCodePoint(self: *Self, byte: u8) !u21 {
@@ -62,7 +79,7 @@ pub const HTMLParserInputStream = struct {
                 return 0x0A;
             },
             0x0A => {
-                if (self.last_item.byte == 0x0D) {
+                if (self.last_item.?.code_point == 0x0D) {
                     self.index += 1;
                     return try self.reader.readByte();
                 }
@@ -129,7 +146,6 @@ const InputStreamConfidence = enum {
 };
 
 pub const InputStreamItem = struct {
-    byte: u8,
     code_point: u21,
     eof: bool,
 };
@@ -145,7 +161,8 @@ test "test" {
         "</html>";
     var stream = io.fixedBufferStream(input);
     const reader = stream.reader().any();
-    var input_stream = HTMLParserInputStream.init(reader);
+    var input_stream = HTMLParserInputStream.init(testing.allocator, reader);
+    defer input_stream.destroy();
 
     while (try input_stream.next()) |item| {
         if (item.eof) {
@@ -162,7 +179,8 @@ test "utf-8 - in 4-byte format" {
     const input = "\xF0\x9F\x98\x80"; // 😀 emoji, 4-byte UTF-8
     var stream = io.fixedBufferStream(input);
     const reader = stream.reader().any();
-    var input_stream = HTMLParserInputStream.init(reader);
+    var input_stream = HTMLParserInputStream.init(testing.allocator, reader);
+    defer input_stream.destroy();
 
     while (try input_stream.next()) |item| {
         if (item.eof) {
@@ -178,7 +196,8 @@ test "utf-8 - in emoji format" {
     const input = "😀";
     var stream = io.fixedBufferStream(input);
     const reader = stream.reader().any();
-    var input_stream = HTMLParserInputStream.init(reader);
+    var input_stream = HTMLParserInputStream.init(testing.allocator, reader);
+    defer input_stream.destroy();
 
     while (try input_stream.next()) |item| {
         if (item.eof) {

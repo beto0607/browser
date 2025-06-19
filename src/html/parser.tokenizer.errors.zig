@@ -1,4 +1,0 @@
-
-pub const ParseErrors = error(
-
-)
